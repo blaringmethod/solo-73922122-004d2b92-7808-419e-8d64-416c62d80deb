@@ -29,7 +29,10 @@
 - 验证在独立的验证集群上为每个作业新建隔离空库，结束后删除；
 - 不关闭任何约束、不把即时约束改写为延迟约束；循环外键通过「先建表→插数据→
   再 `ALTER TABLE ADD CONSTRAINT`」的结构方式装载；
-- 失败不产出、不提供任何部分包，下载仅在 `SUCCEEDED` 后可用。
+- 失败不产出、不提供任何部分包，下载仅在 `SUCCEEDED` 后可用；
+- 作业状态、日志与完整 SQL 包持久化在 Docker 命名卷（`jobstate` → `/data`），
+  服务重启后已成功作业仍可按原作业号下载，未完成作业自动标记 `INTERRUPTED`
+  且不可下载（见下文「持久发布与重启恢复」）。
 
 ## 一键启动（Docker Compose）
 
@@ -51,8 +54,57 @@ docker compose up --build
 | GET | `/schemas/{schema}/tables` | 列出普通基表（非基表关系被标注排除） |
 | GET | `/schemas/{schema}/tables/{table}/structure` | 支持的结构视图；不支持时返回 422 与拒绝原因 |
 | POST | `/jobs` | 提交生成+验证作业（后台执行），返回 `job_id` |
-| GET | `/jobs/{job_id}` | 状态、无解冲突报告、逐步日志 |
-| GET | `/jobs/{job_id}/download` | 仅在验证成功后下载 zip（含 5 个文件） |
+| GET | `/jobs/{job_id}` | 状态、无解冲突报告、逐步日志（含 `INTERRUPTED` 中断记录） |
+| GET | `/jobs/{job_id}/download` | 仅在验证成功且持久提交后下载 zip（含 5 个文件） |
+
+## 持久发布与重启恢复
+
+作业的权威状态存放在 Docker Compose 命名卷 `jobstate`（容器内 `/data`，
+由环境变量 `PERSIST_DIR` 配置），布局：
+
+```
+/data/jobs/<job_id>/
+  job.json        # 完整状态：status / conflict / log / selected_tables
+  package/        # 仅在持久提交成功后存在，含 5 个 SQL 包文件
+  .staging/       # 发布暂存区（对下载接口不可见，重启即清理）
+  .quarantine/    # 中断作业遗留包的隔离区（永不提供下载）
+```
+
+**崩溃安全的提交协议**（验证通过之后才执行）：
+
+1. 包文件逐个写入隐藏目录 `.staging/` 并 `fsync`；
+2. 原子 `rename` 将 `.staging` 提升为可见的 `package/`——包目录要么完整存在、
+   要么不存在，不会出现半包；
+3. 最后才以「临时文件 + fsync + 原子改名」写入 `status=SUCCEEDED` 的
+   `job.json`。
+
+因此只有「包与 SUCCEEDED 状态一同落盘」时作业才显示成功并开放下载。
+已提交的包目录不可被任何新作业覆写（冲突时直接报错 `PackageExists`）。
+
+**重启恢复规则**（进程启动时 `JobStore.recover()` 自动执行，FastAPI
+lifespan 每次启动都会调用并打印恢复统计）：
+
+| 重启前磁盘状态 | 恢复结果 | 下载 |
+| --- | --- | --- |
+| PENDING / GENERATING / VERIFYING | 标记 `INTERRUPTED`，删除 `.staging`，残留包移入 `.quarantine` | 409 拒绝 |
+| SUCCEEDED 但包缺失/不完整 | 标记 `INTERRUPTED`（提交未完成） | 409 拒绝 |
+| SUCCEEDED 且包完整 | 还原为 `SUCCEEDED`，缓存原包 | 按原作业号正常下载 |
+| FAILED（无解/结构拒绝/验证失败等） | 保留冲突报告与日志 | 409 拒绝 |
+
+恢复不会重启或续跑任何未完成作业，也不会复用其临时结果；`INTERRUPTED`
+本身也是持久状态，再次重启仍为中断。源库只读、无解报告与隔离库验证行为
+完全不变。
+
+### 重启演示
+
+```bash
+docker compose up --build
+# 1) 在 http://localhost:8000/docs 用 POST /jobs 提交作业，
+#    GET /jobs/{id} 轮询到 SUCCEEDED 后 GET /jobs/{id}/download 下载 zip；
+# 2) docker compose restart api（或重建容器；命名卷 jobstate 保留）；
+# 3) 再次 GET /jobs/{id}：仍是 SUCCEEDED，下载仍返回同一个 zip；
+#    重启前未跑完的作业则变为 INTERRUPTED，下载返回 409。
+```
 
 ### 请求体
 
@@ -120,13 +172,22 @@ assignment(emp_id,project_id) → employee / project              复合主键+�
 
 ```bash
 python -m venv .venv
-.venv/bin/pip install -r requirements.txt pytest pgserver
+.venv/bin/pip install -r requirements.txt pytest pgserver httpx
 # 准备源库（装结构、建只读角色）后：
 VERIFY_CLEANUP=detach \
 SOURCE_DSN="postgresql://app_ro:app_ro_pwd@/appdb?host=/tmp/pgdata/source" \
 VERIFY_DSN="postgresql://postgres@/postgres?host=/tmp/pgdata/verify" \
 PYTHONPATH=. .venv/bin/python -m pytest tests/
 ```
+
+持久化相关测试：
+
+- `tests/test_persistence_recovery.py`：磁盘状态往返、暂存清理、残留包隔离、
+  不可覆写、TTL 清理、lifespan 恢复与下载 409；
+- `tests/test_recovery_restart.py`：用真实子进程 + `CRASH_AT` 注入
+  `os._exit` 强杀，覆盖生成后、验证后、暂存后、改名后、提交后五个中断点，
+  再以新 `JobStore`（与启动恢复同一代码路径）核对 `INTERRUPTED` / 可下载性。
+  `CRASH_AT` 仅为测试钩子，生产环境不设置即完全关闭。
 
 `VERIFY_CLEANUP`：
 - `drop`（默认，Docker 镜像使用）：每个作业后 `DROP DATABASE`；
@@ -137,8 +198,9 @@ PYTHONPATH=. .venv/bin/python -m pytest tests/
 
 ```
 app/            FastAPI + 内省 + z3 求解 + SQL 渲染 + 隔离库验证
+  persistence.py 崩溃安全的作业/包持久化（暂存→原子改名→SUCCEEDED 提交）与恢复
 sql/            循环引用检验表源结构、源库初始化（只读角色）
 examples/       循环四表、无解冲突、闭包扩展三类请求示例
-tests/          34 个单元/集成/端到端测试（真实 PostgreSQL）
+tests/          单元/集成/端到端测试（真实 PostgreSQL + 强杀重启恢复）
 docker-compose.yml / Dockerfile / requirements.txt
 ```

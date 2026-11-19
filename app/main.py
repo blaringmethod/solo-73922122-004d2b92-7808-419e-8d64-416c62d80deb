@@ -7,8 +7,10 @@ GET  /schemas/{schema}/tables list ordinary base tables (catalog read only)
 GET  /schemas/{schema}/tables/{table}/structure
                               full supported-structure view + rejections
 POST /jobs                    create a generation/verification job
-GET  /jobs/{job_id}           status, conflict report, logs
-GET  /jobs/{job_id}/download  zip package, available only after SUCCEEDED
+GET  /jobs/{job_id}           status, conflict report, logs (INTERRUPTED after
+                              an unfinished job is recovered on restart)
+GET  /jobs/{job_id}/download  zip package, available only after a durable
+                              SUCCEEDED commit on the persistent volume
 GET  /docs                    OpenAPI Swagger UI
 """
 from __future__ import annotations
@@ -31,6 +33,21 @@ from .models import GenerateRequest, JobStatus
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Reconcile the persistent volume on every process start: unfinished jobs
+    # become INTERRUPTED (not downloadable), committed SUCCEEDED jobs and
+    # their SQL packages are restored for continued download.
+    recovered = STORE.recover()
+    interrupted = [
+        jid for jid, job in recovered.items() if job.status == JobStatus.INTERRUPTED
+    ]
+    succeeded = [
+        jid for jid, job in recovered.items() if job.status == JobStatus.SUCCEEDED
+    ]
+    print(
+        f"[startup] recovered {len(recovered)} job(s) from persistent volume: "
+        f"{len(succeeded)} downloadable, {len(interrupted)} interrupted",
+        flush=True,
+    )
     yield
 
 
@@ -122,7 +139,8 @@ def download_job(job_id: str):
     if job.status != JobStatus.SUCCEEDED:
         raise HTTPException(
             409,
-            f"作业尚未验证成功（当前状态 {job.status.value}）；失败作业不提供部分包下载",
+            f"作业未验证成功（当前状态 {job.status.value}）；"
+            "失败或中断作业不提供部分包下载",
         )
     package = STORE.package(job_id)
     if package is None:

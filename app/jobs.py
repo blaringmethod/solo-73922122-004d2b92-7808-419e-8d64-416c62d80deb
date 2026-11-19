@@ -1,11 +1,28 @@
 """Job orchestration: introspect -> solve -> render -> verify -> publish.
 
 A package becomes downloadable only after the verification cluster reports a
-successful load of the full SQL package. Failures retain a structured conflict
-report and logs, never a partial package.
+successful load of the full SQL package **and** both the package and the
+SUCCEEDED state have been durably committed to the persistent volume
+(see :mod:`app.persistence` for the crash-safe commit protocol). Failures
+retain a structured conflict report and logs, never a partial package.
+
+Restart recovery
+----------------
+On process start :meth:`JobStore.recover` scans the persistent volume:
+
+* jobs still in a non-terminal state (PENDING/GENERATING/VERIFYING) are marked
+  INTERRUPTED, their staging scratch is deleted and any package leftovers are
+  quarantined — temporary results are never resumed or reused;
+* a SUCCEEDED job whose package is missing/incomplete is also marked
+  INTERRUPTED (the durable commit never completed);
+* fully committed SUCCEEDED jobs are loaded back with their packages, so
+  engineers can keep downloading them under the original job id;
+* FAILED jobs keep their no-solution / rejection reports and logs.
 """
 from __future__ import annotations
 
+import os
+import sys
 import threading
 import time
 import uuid
@@ -22,48 +39,204 @@ from .models import (
     JobResult,
     JobStatus,
 )
+from .persistence import PACKAGE_FILES, PackageExists, Persistence
 from .selector import validate_request
 from .solver import Generator, SolverTimeout, Unsatisfiable
 from .sqlgen import build_package
 from .verifier import verify_package
 
+#: Non-terminal states: a job found in one of these on disk after a restart
+#: died mid-flight and must be reported as INTERRUPTED.
+_RUNNING_STATES = frozenset(
+    {JobStatus.PENDING, JobStatus.GENERATING, JobStatus.VERIFYING}
+)
+
+
+def _crash_if(phase: str) -> None:
+    """Test-only abrupt-kill hook (``CRASH_AT`` env var). Disabled if unset."""
+    if settings.crash_at and settings.crash_at == phase:
+        # Immediate termination without cleanup: exactly what SIGKILL looks
+        # like to the persistent volume.
+        print(
+            f"crash injection: terminating process at phase {phase!r}",
+            file=sys.stderr,
+            flush=True,
+        )
+        os._exit(137)
+
 
 class JobStore:
-    def __init__(self) -> None:
+    """Thread-safe job registry whose authoritative state lives on disk."""
+
+    def __init__(self, persist_dir: str | None = None) -> None:
         self._jobs: dict[str, JobResult] = {}
         self._packages: dict[str, dict[str, str]] = {}
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
+        self.persistence = Persistence(persist_dir or settings.persist_dir)
+        self.recover()
 
+    # ------------------------------------------------------------- lifecycle
+    def reconfigure(self, persist_dir: str) -> None:
+        """Point the store at another persistent directory and recover it.
+
+        Intended for the test suite; production keeps a single volume path.
+        """
+        with self._lock:
+            self._jobs.clear()
+            self._packages.clear()
+            self.persistence = Persistence(persist_dir)
+            self.recover()
+
+    def recover(self) -> dict[str, JobResult]:
+        """Reconcile on-disk state after a (re)start.
+
+        * staging scratch of every job is removed;
+        * unfinished jobs become INTERRUPTED and their package leftovers are
+          quarantined (never reused, never downloadable);
+        * committed SUCCEEDED jobs with a complete package are restored.
+        """
+        with self._lock:
+            self._jobs.clear()
+            self._packages.clear()
+            self.persistence.ensure_layout()
+
+            # Any staging directory is by definition an unfinished write.
+            for job_id in self.persistence.iter_job_ids():
+                self.persistence.remove_staging(job_id)
+
+            recovered: dict[str, JobResult] = {}
+            for job_id in self.persistence.iter_job_ids():
+                job = self.persistence.read_job(job_id)
+                if job is None:
+                    continue
+                package = self.persistence.read_package(job_id)
+
+                if job.status == JobStatus.SUCCEEDED and package is not None:
+                    # Fully durable commit: state and package both survived.
+                    self._jobs[job_id] = job
+                    self._packages[job_id] = package
+                    recovered[job_id] = job
+                    continue
+
+                if job.status in _RUNNING_STATES:
+                    # The process died during generation/verification/publish.
+                    quarantined = self.persistence.quarantine_package(job_id)
+                    job = self._mark_interrupted(
+                        job,
+                        reason=(
+                            "服务重启时作业仍在运行（上一进程在生成/验证/发布途中终止），"
+                            "已标记为中断；临时结果不会被复用，且不提供下载。"
+                        ),
+                        quarantined=quarantined,
+                    )
+                elif job.status == JobStatus.SUCCEEDED:
+                    # SUCCEEDED json without a complete package means the
+                    # durable commit was interrupted before it finished.
+                    self.persistence.quarantine_package(job_id)
+                    job = self._mark_interrupted(
+                        job,
+                        reason=(
+                            "作业状态已成功但持久卷上的 SQL 包不完整，提交未完成；"
+                            "已标记为中断且不提供下载。"
+                        ),
+                        quarantined=False,
+                    )
+                else:
+                    # FAILED / previously INTERRUPTED: keep the durable record,
+                    # but never let stray package files become downloadable.
+                    self.persistence.quarantine_package(job_id)
+
+                self.persistence.write_job(job)
+                self._jobs[job_id] = job
+                recovered[job_id] = job
+            return recovered
+
+    def _mark_interrupted(
+        self, job: JobResult, reason: str, quarantined: bool
+    ) -> JobResult:
+        data = job.model_dump()
+        data["status"] = JobStatus.INTERRUPTED
+        data["log"] = list(data.get("log") or []) + [
+            f"{datetime.now(timezone.utc).time().isoformat()} "
+            f"recovery: {reason}"
+            + (" 已隔离残留包文件。" if quarantined else "")
+        ]
+        data["conflict"] = ConflictReport(
+            kind="interrupted",
+            message=reason,
+            details={
+                "previous_status": job.status.value,
+                "package_quarantined": quarantined,
+                "downloadable": False,
+            },
+        ).model_dump()
+        return JobResult(**data)
+
+    # --------------------------------------------------------------- writes
     def create(self) -> str:
         job_id = uuid.uuid4().hex
         with self._lock:
-            self._jobs[job_id] = JobResult(
+            job = JobResult(
                 job_id=job_id,
                 status=JobStatus.PENDING,
                 created_at=datetime.now(timezone.utc).isoformat(),
             )
+            self.persistence.write_job(job)
+            self._jobs[job_id] = job
         return job_id
 
     def get(self, job_id: str) -> JobResult | None:
-        return self._jobs.get(job_id)
+        with self._lock:
+            return self._jobs.get(job_id)
 
     def package(self, job_id: str) -> dict[str, str] | None:
-        return self._packages.get(job_id)
+        with self._lock:
+            return self._packages.get(job_id)
 
     def update(self, job_id: str, **kw) -> None:
         with self._lock:
             job = self._jobs[job_id]
             data = job.model_dump()
             data.update(kw)
-            self._jobs[job_id] = JobResult(**data)
+            job = JobResult(**data)
+            self.persistence.write_job(job)
+            self._jobs[job_id] = job
 
     def append_log(self, job_id: str, line: str) -> None:
         with self._lock:
             job = self._jobs[job_id]
-            job.log.append(f"{datetime.now(timezone.utc).time().isoformat()} {line}")
+            data = job.model_dump()
+            data["log"] = list(data["log"]) + [
+                f"{datetime.now(timezone.utc).time().isoformat()} {line}"
+            ]
+            job = JobResult(**data)
+            self.persistence.write_job(job)
+            self._jobs[job_id] = job
 
-    def publish(self, job_id: str, package: dict[str, str]) -> None:
+    # ------------------------------------------------------------- publish
+    def stage_package(
+        self, job_id: str, package: dict[str, str]
+    ) -> None:
+        """Durably write package files into the hidden staging area."""
         with self._lock:
+            self.persistence.stage_package(job_id, package)
+
+    def commit_published(self, job_id: str) -> None:
+        """Promote the staged package and cache it for downloads.
+
+        The package directory is made visible *before* the SUCCEEDED state is
+        written (see :func:`run_job`), and an existing package can never be
+        overwritten.
+        """
+        with self._lock:
+            if self.persistence.package_dir(job_id).exists():
+                raise PackageExists(
+                    f"refusing to overwrite existing package for job {job_id}"
+                )
+            self.persistence.commit_package(job_id)
+            package = self.persistence.read_package(job_id)
+            # A complete rename guarantees all PACKAGE_FILES are present.
+            assert package is not None and len(package) == len(PACKAGE_FILES)
             self._packages[job_id] = package
 
     def purge_expired(self) -> None:
@@ -78,6 +251,7 @@ class JobStore:
             for jid in stale:
                 self._jobs.pop(jid, None)
                 self._packages.pop(jid, None)
+                self.persistence.remove_job_dir(jid)
 
 
 STORE = JobStore()
@@ -110,6 +284,7 @@ def _conflict_from_groups(groups) -> ConflictReport:
 def run_job(job_id: str, req: GenerateRequest) -> None:
     store = STORE
     try:
+        _crash_if("start")
         store.update(job_id, status=JobStatus.GENERATING)
         store.append_log(job_id, "opening read-only source connection (catalogs only)")
         with source_connection(settings.source_dsn) as conn:
@@ -220,6 +395,7 @@ def run_job(job_id: str, req: GenerateRequest) -> None:
 
         specs = {s.table: s for s in req.tables}
 
+        _crash_if("generated")
         store.append_log(job_id, "solving constraints with z3 (hard: rows, ranges, PK/UK/FK)")
         gen = Generator({t: schemas[t] for t in selected}, specs)
         try:
@@ -274,10 +450,20 @@ def run_job(job_id: str, req: GenerateRequest) -> None:
             )
             return
 
-        # Only now is the package stored and downloadable.
-        store.publish(job_id, package)
-        store.append_log(job_id, "package verified and published")
+        _crash_if("verified")
+
+        # ---- Durable publish: staging -> atomic rename -> SUCCEEDED ----
+        # Only a fully verified package reaches this point. Files are first
+        # staged (and fsynced) under a hidden directory, then atomically
+        # renamed into place, and only then is the SUCCEEDED state committed.
+        # A new package can never overwrite an existing one (PackageExists).
+        store.stage_package(job_id, package)
+        _crash_if("publish_staged")
+        store.commit_published(job_id)
+        _crash_if("publish_renamed")
+        store.append_log(job_id, "package verified and durably published")
         store.update(job_id, status=JobStatus.SUCCEEDED)
+        _crash_if("published")
     except Exception as exc:  # defensive: never leave a job dangling
         store.append_log(job_id, f"unexpected error: {exc.__class__.__name__}: {exc}")
         store.update(

@@ -24,6 +24,23 @@ VERIFY_DSN = os.environ.get(
 os.environ.setdefault("VERIFY_CLEANUP", "detach")
 
 
+@pytest.fixture(autouse=True)
+def isolated_persistent_store(tmp_path):
+    """Give every test a fresh on-disk job store and re-run recovery on it.
+
+    The store's authoritative state is the persistent directory, so pointing
+    ``STORE`` at a tmp_path also emulates a clean first boot. Tests that need
+    to simulate a restart instantiate a second :class:`JobStore` over the same
+    directory (or call ``STORE.recover()``).
+    """
+    from app.jobs import STORE
+
+    persist_dir = tmp_path / "jobstate"
+    STORE.reconfigure(str(persist_dir))
+    yield persist_dir
+    STORE.reconfigure(str(tmp_path / "jobstate-discarded"))
+
+
 @pytest.fixture(scope="session")
 def source_dsn() -> str:
     # Ensure the demo source cluster exists and is reachable.

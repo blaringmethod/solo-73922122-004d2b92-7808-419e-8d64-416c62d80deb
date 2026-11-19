@@ -139,6 +139,10 @@ class JobStatus(str, Enum):
     VERIFYING = "VERIFYING"
     SUCCEEDED = "SUCCEEDED"
     FAILED = "FAILED"
+    # Assigned during restart recovery to jobs that were still running when
+    # the previous process died. Their temporary results are discarded and
+    # their packages (if any) are quarantined, so they can never be downloaded.
+    INTERRUPTED = "INTERRUPTED"
 
 
 class ConflictReport(BaseModel):

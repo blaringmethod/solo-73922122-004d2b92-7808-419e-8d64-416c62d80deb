@@ -54,9 +54,21 @@ services:
       VERIFY_CLEANUP: "drop"
       MAX_TABLES: "4"
       MAX_ROWS_PER_TABLE: "20"
+      # Durable job state, logs and verified SQL packages live on the named
+      # volume so they survive `docker compose restart` / container rebuilds.
+      PERSIST_DIR: /data
+    volumes:
+      - jobstate:/data
     ports:
       - "8000:8000"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/healthz', timeout=5).status == 200 else 1)\""]
+      interval: 5s
+      timeout: 5s
+      retries: 20
 
 volumes:
   source_pgdata:
   verify_pgdata:
+  # Persistent publish/recovery store for job states, logs and SQL packages.
+  jobstate:

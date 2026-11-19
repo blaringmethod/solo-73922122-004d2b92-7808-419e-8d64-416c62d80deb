@@ -32,6 +32,18 @@ class Settings:
     #            only on sandboxed kernels that deny checkpoint signals, where
     #            DROP DATABASE would block. A normal postgres image uses "drop".
     verify_cleanup: str = os.environ.get("VERIFY_CLEANUP", "drop")
+    # Directory on a persistent volume where job state, logs and verified SQL
+    # packages are durably committed. In Docker Compose it is the mount point
+    # of the named volume; outside Docker it defaults to a local state dir so
+    # the test suite / bare-metal runs still get restart recovery.
+    persist_dir: str = os.environ.get(
+        "PERSIST_DIR",
+        "/data" if os.access("/", os.W_OK) else "./.jobstate",
+    )
+    # Test-only crash injection: when set, the matching job phase terminates
+    # the process immediately (os._exit), simulating an abrupt kill in the
+    # middle of generation, verification or publishing. Never set in production.
+    crash_at: str = os.environ.get("CRASH_AT", "")
 
 
 settings = Settings()
